@@ -46,6 +46,12 @@ var _pending_procedure_call: Dictionary[int, SpacetimeDBProcedureCall] = {}
 var _pending_subscriptions: Dictionary[int, SpacetimeDBSubscription]
 var _pending_one_off_query_callbacks: Dictionary[int,SpacetimeDBPendingOneOffQuery]
 
+# Anon-token POST to /v1/identity flakily returns RESULT_CONNECTION_ERROR on web;
+# retry with backoff before surfacing the fatal connection_error.
+const _TOKEN_REQUEST_MAX_ATTEMPTS: int = 4
+const _TOKEN_REQUEST_BASE_DELAY_S: float = 0.5
+var _token_request_attempts: int = 0
+
 # --- Signals ---
 signal connected(identity: PackedByteArray, token: String)
 signal disconnected
@@ -59,6 +65,7 @@ signal row_updated(table_name: String, old_row: Resource, new_row: Resource)
 signal row_deleted(table_name: String, row: Resource)
 signal row_transactions_completed(table_name: String)
 
+signal reducer_call_sent(request_id: int)
 signal reducer_call_response(response: ReducerResultMessage)
 signal reducer_call_timeout(request_id: int) # TODO: Implement timeout logic
 signal procedure_call_response(response: ProcedureResultMessage)
@@ -170,6 +177,7 @@ func _generate_connection_id() -> String:
 
 func _on_token_received(received_token: String):
 	print_log("SpacetimeDBClient: Token acquired.")
+	_token_request_attempts = 0
 	self._token = received_token
 	if save_token:
 		_save_token(received_token)
@@ -181,8 +189,24 @@ func _on_token_received(received_token: String):
 	# Now attempt to connect WebSocket
 	_connection.connect_to_database(base_url, database_name, conn_id, connection_options.confirmed_reads)
 
-func _on_token_request_failed(error_code: int, response_body: String):
-	printerr("SpacetimeDBClient: Failed to acquire token. Cannot connect.")
+func _on_token_request_failed(error_code: int, _response_body: String) -> void:
+	_token_request_attempts += 1
+	if _token_request_attempts < _TOKEN_REQUEST_MAX_ATTEMPTS:
+		var delay: float = _TOKEN_REQUEST_BASE_DELAY_S * pow(2.0, float(_token_request_attempts - 1))
+		printerr("SpacetimeDBClient: token acquire failed (code %d), retrying in %.1fs (attempt %d/%d)"
+			% [error_code, delay, _token_request_attempts, _TOKEN_REQUEST_MAX_ATTEMPTS])
+		# The client (or its _rest_api) can be freed during the wait (teardown) —
+		# guard get_tree() before the await and _rest_api after.
+		var tree := get_tree()
+		if tree == null:
+			return
+		await tree.create_timer(delay).timeout
+		if not is_instance_valid(_rest_api):
+			return
+		_rest_api.request_new_token()
+		return
+	printerr("SpacetimeDBClient: Failed to acquire token after %d attempts. Cannot connect." % _token_request_attempts)
+	_token_request_attempts = 0
 	emit_signal("connection_error", error_code, "Failed to acquire authentication token")
 
 func _save_token(token_to_save: String):
@@ -413,11 +437,13 @@ func connect_db(host_url: String, database_name: String, options: SpacetimeDBCon
 	self.debug_mode = options.debug_mode
 	self.use_threading = options.threading
 
-	if OS.has_feature("web") and use_threading == true:
-		push_error("Threads are not supported on Web. Threading has been disabled.")
+	if use_threading == true and not OS.has_feature("threads"):
+		push_error("Threads not supported by this build (non-threaded export). Threading has been disabled.")
 		use_threading = false
 
-	if use_threading:
+	# Reuse the existing worker on reconnect (connect_db re-called) — a second
+	# thread would race the same packet queue.
+	if use_threading and deserializer_worker == null:
 		_packet_mutex = Mutex.new()
 		_packet_semaphore = Semaphore.new()
 		_result_mutex = Mutex.new()
@@ -599,6 +625,7 @@ func call_reducer(reducer_name: String, args: Array = [], types: Array = []) -> 
 			return SpacetimeDBReducerCall.fail(err)
 		var reducer_call = SpacetimeDBReducerCall.create(self, request_id)
 		_pending_reducer_call.set(request_id, reducer_call)
+		reducer_call_sent.emit(request_id)
 		return reducer_call
 
 	print("SpacetimeDBClient: Internal error - WebSocket peer not available in connection.")

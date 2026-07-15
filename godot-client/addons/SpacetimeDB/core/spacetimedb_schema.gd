@@ -23,28 +23,19 @@ func _init(p_module_name: String, p_schema_path: String = "res://spacetime_bindi
 	load_table_types()
 
 func _load_files(path: String, dict:Dictionary[StringName, GDScript], is_core: bool = false) -> void:
-	var dir := DirAccess.open(path)
-	if not DirAccess.dir_exists_absolute(path):
+	var files := ResourceLoader.list_directory(path)
+	var dirs := DirAccess.get_directories_at(path)
+	if files.is_empty() and dirs.is_empty():
 		printerr("SpacetimeDBSchema: Schema directory does not exist: ", path)
 		return
 	if debug_mode:
 		prints("path", path, "start loading")
-	dir.list_dir_begin()
-	while true:
-		var file_name := dir.get_next().trim_suffix(".remap")
-		if file_name == "":
-			if debug_mode:
-				prints("path:", path, "finished loading")
-			break
 
-		# handle nested folders
-		if dir.current_is_dir():
-			var dir_name := file_name
-			if dir_name != "." and dir_name != "..":
-				var dir_path := path.path_join(dir_name)
-				_load_files(dir_path, dict, is_core)
-			continue
+	# handle nested folders
+	for dir_name in dirs:
+		_load_files(path.path_join(dir_name), dict, is_core)
 
+	for file_name in files:
 		#skip non script files
 		if not file_name.ends_with(".gd"):
 			if debug_mode and not file_name.ends_with(".uid"):
@@ -72,7 +63,9 @@ func _load_files(path: String, dict:Dictionary[StringName, GDScript], is_core: b
 				prints("script", script_path, "loaded")
 		else:
 			printerr("SpacetimeDBSchema: Script file found but can't instantiate (there is an error inside this file): ", script_path)
-	dir.list_dir_end()
+
+	if debug_mode:
+		prints("path:", path, "finished loading")
 
 func load_table_types():
 	for type_script:GDScript in module_types.values():

@@ -54,6 +54,23 @@ static func parse_schema(p_schema: Dictionary, module_name: String) -> Spacetime
 	var schema_procedures: Array = sections.get("Procedures", [])
 	var schema_views: Array = sections.get("Views", [])
 
+	# `#[view(primary_key = col)]` declarations. Single-column keys only — that is
+	# all the server macro accepts. Without a primary key the generated view table
+	# defaults to field 0, so LocalDatabase can't key rows and never emits per-row
+	# update/delete events for the view.
+	var view_pk_by_name: Dictionary[String, String] = {}
+	for pk_info: Dictionary in sections.get("ViewPrimaryKeys", []):
+		var pk_columns: Array = pk_info.get("columns", [])
+		if pk_columns.size() == 1:
+			view_pk_by_name[String(pk_info.get("view_source_name", "")).to_snake_case()] = str(pk_columns[0])
+
+	# Server schema sections are HashMap-backed; iteration order varies per publish.
+	# Sort once at parse time so downstream codegen output is deterministic.
+	_sort_by_source_name(schema_tables)
+	_sort_by_source_name(schema_reducers)
+	_sort_by_source_name(schema_procedures)
+	_sort_by_source_name(schema_views)
+
 	var parsed_schema := SpacetimeParsedSchema.new()
 	parsed_schema.module = module_pascal
 
@@ -224,6 +241,9 @@ static func parse_schema(p_schema: Dictionary, module_name: String) -> Spacetime
 					% [unique_field_idx, table_name, target_type_def.struct.size()]
 				)
 
+		parsed_unique_indexes.sort_custom(func(a, b):
+			return String(a["constraint_name"]) < String(b["constraint_name"])
+		)
 		table_data["unique_indexes"] = parsed_unique_indexes
 
 		var is_public: bool = not table_info.get("table_access", {}).has("Private")
@@ -265,6 +285,23 @@ static func parse_schema(p_schema: Dictionary, module_name: String) -> Spacetime
 			SpacetimePlugin.print_err("view return type not found: %s" % [return_type_dict])
 			continue
 
+		# Resolve the view's declared primary key to a field index in the row struct.
+		var view_pk_idx := 0
+		var view_pk_name: String = view_pk_by_name.get(name, "")
+		if not view_pk_name.is_empty():
+			var struct_fields: Array = return_type.get("struct", [])
+			view_pk_idx = -1
+			for i in range(struct_fields.size()):
+				if String(struct_fields[i].get("name", "")) == view_pk_name:
+					view_pk_idx = i
+					break
+			if view_pk_idx < 0:
+				SpacetimePlugin.print_err(
+					"View '%s' primary key column '%s' not found in its row type" % [name, view_pk_name]
+				)
+				view_pk_idx = 0
+				view_pk_name = ""
+
 		if return_type.get("table_names", []).is_empty():
 			return_type = {
 				"name": return_type.get("name", ""),
@@ -272,8 +309,8 @@ static func parse_schema(p_schema: Dictionary, module_name: String) -> Spacetime
 				"struct": return_type.get("struct", []),
 				"table_names": [name],
 				"table_name": name,
-				"primary_key": 0,
-				"primary_key_name": "",
+				"primary_key": view_pk_idx,
+				"primary_key_name": view_pk_name,
 				"is_public": [true],
 			}
 		else:
@@ -297,8 +334,8 @@ static func parse_schema(p_schema: Dictionary, module_name: String) -> Spacetime
 			new_table_dict = {
 				"name": module_name + "_"+ name,
 				"type_idx": type_index,
-				"primary_key": 0,
-				"primary_key_name": "",
+				"primary_key": view_pk_idx,
+				"primary_key_name": view_pk_name,
 				"unique_indexes": [],
 				"is_public": true,
 			}
@@ -308,6 +345,10 @@ static func parse_schema(p_schema: Dictionary, module_name: String) -> Spacetime
 			new_table_dict["is_public"] = true
 
 		parsed_tables_list.append(new_table_dict)
+
+	parsed_tables_list.sort_custom(func(a, b):
+		return String(a["name"]) < String(b["name"])
+	)
 
 	SpacetimePlugin.print_log("Schema parser finished")
 	parsed_schema.types = parsed_types_list
@@ -328,6 +369,10 @@ static func _section_typespace(sections: Dictionary) -> Array:
 	if typespace_section is Dictionary:
 		return typespace_section.get("types", [])
 	return []
+
+static func _sort_by_source_name(arr: Array) -> void:
+	arr.sort_custom(func(a, b): return _source_name(a) < _source_name(b))
+
 
 static func _source_name(value: Variant) -> String:
 	if value is Dictionary:

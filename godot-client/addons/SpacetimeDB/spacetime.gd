@@ -11,6 +11,7 @@ const SAVE_PATH := BINDINGS_PATH + "/plugin_config.tres"
 const CONFIG_PATH := "res://addons/SpacetimeDB/plugin.cfg"
 const UI_PANEL_NAME := "SpacetimeDB"
 const UI_PATH := "res://addons/SpacetimeDB/ui/ui.tscn"
+const ENGINE_META_KEY := "spacetimedb_plugin"
 
 var http_request := HTTPRequest.new()
 var plugin_config: SpacetimeDBPluginConfig
@@ -21,6 +22,7 @@ static var instance: SpacetimePlugin
 
 func _enter_tree():
 	instance = self
+	Engine.set_meta(ENGINE_META_KEY, self)
 
 	if not is_instance_valid(dock):
 		var scene = load(UI_PATH)
@@ -109,13 +111,59 @@ func _on_check_uri():
 		print_log("Result: %s, Response code: %s" % [result[3].get_string_from_utf8(), result[1]])
 	print_log("request took: "+ str(Time.get_ticks_usec() - ping_start) + " µs")
 
-func _on_generate_schema():
+## Programmatic regen entry point.
+## Returns the same status Dictionary as `_on_generate_schema()`, plus a file diff against the
+## previous on-disk binding set so callers (e.g. the AI Bridge MCP tool) don't have to scrape UI logs.
+func regenerate_bindings() -> Dictionary:
+	if plugin_config == null or plugin_config.module_configs.is_empty():
+		return {
+			"success": false,
+			"error": "No SpacetimeDB module configs registered. Open the SpacetimeDB dock and add a module first.",
+			"bindings_dir": BINDINGS_SCHEMA_PATH,
+			"added_files": [],
+			"removed_files": [],
+			"generated_files": [],
+			"errors": [],
+		}
+
+	var files_before: Array[String] = []
+	_collect_gd_files_recursive(BINDINGS_SCHEMA_PATH, files_before)
+	files_before.sort()
+
+	var codegen_result: Dictionary = await _on_generate_schema()
+	var generated_files: Array[String] = codegen_result.get("generated_files", [])
+	var generated_set: Dictionary = {}
+	for f: String in generated_files:
+		generated_set[f] = true
+
+	var added_files: Array[String] = []
+	var removed_files: Array[String] = []
+	for f: String in generated_files:
+		if not files_before.has(f):
+			added_files.append(f)
+	for f: String in files_before:
+		if not generated_set.has(f):
+			removed_files.append(f)
+
+	return {
+		"success": bool(codegen_result.get("success", false)),
+		"bindings_dir": BINDINGS_SCHEMA_PATH,
+		"files_before": files_before.size(),
+		"files_after": generated_files.size(),
+		"added_files": added_files,
+		"removed_files": removed_files,
+		"generated_files": generated_files,
+		"errors": codegen_result.get("errors", []),
+	}
+
+
+func _on_generate_schema() -> Dictionary:
 	if plugin_config.uri.ends_with("/"):
 		plugin_config.uri = plugin_config.uri.left(-1)
 
 	print_log("Starting code generation...")
 	print_log("Fetching module schemas...")
-	var failed = false
+	var errors: Array[String] = []
 	for module_alias: String in plugin_config.module_configs:
 		var module_config: SpacetimeDBModuleConfig = plugin_config.module_configs[module_alias]
 		var schema_uri := "%s/v1/database/%s/schema?version=10" % [plugin_config.uri, module_config.name]
@@ -128,23 +176,27 @@ func _on_generate_schema():
 			print_log("Fetched schema for module: %s with alias: %s" % [module_config.name, module_config.alias])
 			continue
 
+		var fetch_error: String
 		if result[1] == 404:
-			print_err("Module not found - %s" % [schema_uri])
+			fetch_error = "Module not found - %s" % [schema_uri]
 		elif result[1] == 0:
-			print_err("Request timeout - %s" % [schema_uri])
+			fetch_error = "Request timeout - %s" % [schema_uri]
 		else:
-			print_err("Failed to fetch module schema: %s - Response code %s" % [module_config.name, result[1]])
-		failed = true
+			fetch_error = "Failed to fetch module schema: %s - Response code %s" % [module_config.name, result[1]]
+		print_err(fetch_error)
+		errors.append(fetch_error)
 
-	if failed:
+	if not errors.is_empty():
 		print_err("Code generation failed!")
-		return
+		var empty_files: Array[String] = []
+		return {"success": false, "errors": errors, "generated_files": empty_files}
 
 	var codegen := SpacetimeCodegen.new(BINDINGS_SCHEMA_PATH)
 	codegen._plugin_config = plugin_config
-	var generated_files := codegen.generate_bindings()
+	var generated_files: Array[String] = codegen.generate_bindings()
 
 	_cleanup_unused_classes(BINDINGS_SCHEMA_PATH, generated_files)
+	_check_uid_collisions()
 
 	if DirAccess.dir_exists_absolute(LEGACY_DATA_PATH):
 		print_log("Removing legacy data directory: %s" % LEGACY_DATA_PATH)
@@ -164,23 +216,66 @@ func _on_generate_schema():
 		continue
 	get_editor_interface().get_resource_filesystem().scan()
 	print_log("Code generation complete!")
+	return {"success": true, "errors": errors, "generated_files": generated_files}
 
 
-func _cleanup_unused_classes(dir_path: String = "res://schema", files: Array[String] = []) -> void:
-	var dir = DirAccess.open(dir_path)
-	if not dir: return
-	print_log("File Cleanup: Scanning folder: " + dir_path)
-	for file in dir.get_files():
-		if not file.ends_with(".gd"): continue
-		var full_path = "%s/%s" % [dir_path, file]
-		if not full_path in files:
-			print_log("Removing file: %s" % [full_path])
-			DirAccess.remove_absolute(full_path)
-			if FileAccess.file_exists("%s.uid" % [full_path]):
-				DirAccess.remove_absolute("%s.uid" % [full_path])
-	var subfolders = dir.get_directories()
-	for folder in subfolders:
-		_cleanup_unused_classes(dir_path + "/" + folder, files)
+## Walks `dir_path` recursively and appends every `.gd` file path to `out`.
+## Editor-only — uses the iterator API which is fine outside exported builds.
+func _collect_gd_files_recursive(dir_path: String, out: Array[String]) -> void:
+	var dir := DirAccess.open(dir_path)
+	if not dir:
+		return
+	for file_name: String in dir.get_files():
+		if file_name.ends_with(".gd"):
+			out.append("%s/%s" % [dir_path, file_name])
+	for sub: String in dir.get_directories():
+		_collect_gd_files_recursive("%s/%s" % [dir_path, sub], out)
+
+
+## Walks `dir_path` recursively and appends every file ending in `suffix` to `out`.
+func _collect_files_by_suffix(dir_path: String, suffix: String, out: Array[String]) -> void:
+	var dir := DirAccess.open(dir_path)
+	if not dir:
+		return
+	for file_name: String in dir.get_files():
+		if file_name.ends_with(suffix):
+			out.append("%s/%s" % [dir_path, file_name])
+	for sub: String in dir.get_directories():
+		_collect_files_by_suffix("%s/%s" % [dir_path, sub], suffix, out)
+
+
+## Deterministic binding uids share the full 63-bit id space with Godot's
+## randomly-minted uids, so a clash is possible (~1e-13) — and because our ids
+## are deterministic, a clash would reproduce on every clone. Scan the whole
+## project for duplicate uid ids and shout loudly if any exist. If this ever
+## fires, salt `_stable_uid_id` (e.g. prefix a version byte) and regenerate.
+func _check_uid_collisions() -> void:
+	var uid_files: Array[String] = []
+	_collect_files_by_suffix("res://", ".uid", uid_files)
+	var seen: Dictionary[int, String] = {}
+	for path: String in uid_files:
+		var text := FileAccess.get_file_as_string(path).strip_edges()
+		if text.is_empty():
+			continue
+		var id: int = ResourceUID.text_to_id(text)
+		if id == ResourceUID.INVALID_ID:
+			continue
+		if seen.has(id):
+			print_err("UID collision (%s): %s <-> %s" % [text, seen[id], path])
+		else:
+			seen[id] = path
+
+
+func _cleanup_unused_classes(dir_path: String = "res://schema", keep: Array[String] = []) -> void:
+	var existing: Array[String] = []
+	_collect_gd_files_recursive(dir_path, existing)
+	for full_path: String in existing:
+		if keep.has(full_path):
+			continue
+		print_log("Removing file: %s" % [full_path])
+		DirAccess.remove_absolute(full_path)
+		if FileAccess.file_exists("%s.uid" % [full_path]):
+			DirAccess.remove_absolute("%s.uid" % [full_path])
 
 static func clear_logs():
 	if instance != null and is_instance_valid(instance.ui):
@@ -209,3 +304,6 @@ func _exit_tree():
 
 	if ProjectSettings.has_setting("autoload/" + AUTOLOAD_NAME):
 		remove_autoload_singleton(AUTOLOAD_NAME)
+
+	if Engine.get_meta(ENGINE_META_KEY, null) == self:
+		Engine.remove_meta(ENGINE_META_KEY)

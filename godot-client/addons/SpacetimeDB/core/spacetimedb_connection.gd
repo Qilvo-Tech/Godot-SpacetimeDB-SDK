@@ -8,8 +8,14 @@ var _is_connected: bool = false
 var _connection_requested: bool = false
 var _debug_mode: bool = false
 var version: String = "v1"
-# Protocol constants
-const BSATN_PROTOCOL = "v3.bsatn.spacetimedb"
+# Protocol constants.
+# LOCAL PATCH: v0.3.2 shipped this as "v3.bsatn.spacetimedb" but the SDK's parser
+# is the stdb-v2-protocol implementation (PR #134 branch). The v3 wire protocol
+# silently DROPS reducer-result deliveries under scheduled-reducer load (the
+# world_sync burst racing the physics tick) — v2 is immune, and the official
+# SpacetimeDB SDKs pin v2. Our 2.6 server negotiates both. See memory
+# project_sync_timeout_debug + the resultdrop repro/ISSUE.md.
+const BSATN_PROTOCOL = "v2.bsatn.spacetimedb"
 
 enum CompressionPreference { NONE = 0, BROTLI = 1, GZIP = 2 }
 var preferred_compression: CompressionPreference = CompressionPreference.NONE # Default to None
@@ -231,8 +237,12 @@ func _handle_game_closing():
 	get_tree().quit()
 
 func _exit_tree() -> void:
+	# Disconnect on node removal, but never get_tree().quit() here — _exit_tree
+	# fires when the transient world-sync client is freed, so quitting killed the
+	# whole game. Real app-close is handled by the notifications below.
 	_print_log("SpacetimeDBConnection: Exit Tree")
-	_handle_game_closing()
+	if _websocket != null and _websocket.get_ready_state() != WebSocketPeer.STATE_CLOSED:
+		disconnect_from_server()
 
 func _notification(what: int) -> void:
 	match what:
