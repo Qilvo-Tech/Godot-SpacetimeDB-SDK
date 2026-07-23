@@ -24,14 +24,64 @@ class_name SpacetimeAuth extends Node
 # callers. Build `extra_fields` per provider (e.g. {"gpg_authcode": code} for
 # Google Play, {"epic_id_token": jwt} for Epic); grant-type strings and field
 # names are documented at https://docs.spacetimedb.com/ .
+#
+# A failure reports facts, never prose: only the consuming game knows its tone,
+# its languages, and what is safe to show a user.
+
+
+## One HTTP attempt. The per-attempt timings are what separate failure modes that
+## look identical from the final verdict alone: five attempts of ~20ms means no
+## resolver, five of exactly `request_timeout_seconds` means a blocked port.
+class Attempt extends RefCounted:
+	var offset_ms: int = 0
+	var elapsed_ms: int = 0
+	## Non-OK when `HTTPRequest.request()` refused to submit; the two fields
+	## below then stay at their defaults.
+	var submit_error: Error = OK
+	## `HTTPRequest.Result`; -1 if never submitted.
+	var transport_result: int = -1
+	## 0 = no response was produced at all, so the fault is below HTTP.
+	var http_status: int = 0
+
+	func is_transport_failure() -> bool:
+		return submit_error != OK or http_status == 0
+
 
 class ExchangeResult extends RefCounted:
 	var id_token: String = ""
 	var expires_in: int = 0
 	var error: String = ""
+	var endpoint: String = ""
+	## Empty if the exchange failed before any request went out. The 1-based
+	## attempt number is the array position.
+	var attempts: Array[Attempt] = []
+	## The denominator in "attempt 2 of 5". NOT `attempts.size()`: the ladder
+	## stops early on an authoritative 2xx/4xx, so a first-try 401 leaves one
+	## attempt out of five.
+	var max_attempts: int = 0
+	## Non-200 body, passed through `redact_fields`.
+	var response_body: String = ""
 
 	func is_successful() -> bool:
 		return error.is_empty()
+
+	func last_attempt() -> Attempt:
+		return attempts[-1] if not attempts.is_empty() else null
+
+	## Feed to `SpacetimeAuth.transport_result_name()` for a readable enum name.
+	func transport_result() -> int:
+		var last: Attempt = last_attempt()
+		return last.transport_result if last != null else -1
+
+	func http_status() -> int:
+		var last: Attempt = last_attempt()
+		return last.http_status if last != null else 0
+
+	## No HTTP response ever came back, so the fault is below HTTP (DNS, routing,
+	## TLS) — most likely the client's own machine or network, not the server.
+	func is_transport_failure() -> bool:
+		var last: Attempt = last_attempt()
+		return last != null and last.is_transport_failure()
 
 
 signal exchange_completed(result: ExchangeResult)
@@ -43,8 +93,11 @@ const TOKEN_URL_DEFAULT: String = "https://auth.spacetimedb.com/oidc/token"
 @export var token_url: String = TOKEN_URL_DEFAULT
 ## Bounds the network hang on an unreachable endpoint (DNS stall, TLS failure).
 @export var request_timeout_seconds: float = 15.0
-## Total attempts before giving up. Transient failures (transport error / 5xx)
-## are retried; a 2xx/4xx is authoritative and never retried.
+## Transient failures (transport error / 5xx) are retried; a 2xx/4xx is
+## authoritative and never retried. Set these from the consuming game — how long
+## a user waits before being told sign-in failed is a product decision. Worst
+## case is `max_attempts * request_timeout_seconds` PLUS the backoff, which a
+## hung TCP connect does reach.
 @export var max_attempts: int = 4
 @export var base_retry_delay_seconds: float = 0.5
 @export var max_retry_delay_seconds: float = 4.0
@@ -64,12 +117,23 @@ func _print_log(message: String) -> void:
 func _ensure_http() -> void:
 	if _http == null or not is_instance_valid(_http):
 		_http = HTTPRequest.new()
-		_http.timeout = request_timeout_seconds
 		add_child(_http)
+	# Per exchange, not just at construction — the node is reusable, and an
+	# @export that stopped taking effect after the first call would be a trap.
+	_http.timeout = request_timeout_seconds
 
 
 func exchange(grant_type: String, extra_fields: Dictionary, client_id: String) -> ExchangeResult:
 	var result: ExchangeResult = ExchangeResult.new()
+	result.endpoint = token_url
+	result.max_attempts = max_attempts
+	if max_attempts < 1:
+		# Otherwise the loop never runs and this surfaces as "unexpected
+		# request_completed payload", pointing triage at the network not the config.
+		result.error = "max_attempts must be >= 1 (got %d)" % max_attempts
+		push_error("[SpacetimeAuth] %s" % result.error)
+		exchange_completed.emit(result)
+		return result
 	if client_id.is_empty():
 		result.error = "client_id empty"
 		exchange_completed.emit(result)
@@ -96,22 +160,31 @@ func exchange(grant_type: String, extra_fields: Dictionary, client_id: String) -
 		token_url, grant_type, client_id, body.length(),
 	])
 
-	# Retry transient failures with exponential backoff: a request submit error,
-	# no HTTP response (transport-level DNS/connect/timeout), or a 5xx. A 2xx/4xx
-	# is authoritative and breaks out immediately.
+	# Retried with exponential backoff: submit error, no HTTP response, or 5xx.
+	# A 2xx/4xx is authoritative and breaks out immediately.
 	var response: Array = []
-	for attempt: int in max_attempts:
-		var last: bool = attempt == max_attempts - 1
+	var run_started_ms: int = Time.get_ticks_msec()
+	for attempt_index: int in max_attempts:
+		var last: bool = attempt_index == max_attempts - 1
+		var attempt: Attempt = Attempt.new()
+		attempt.offset_ms = Time.get_ticks_msec() - run_started_ms
+		result.attempts.append(attempt)
+
 		var err: Error = _http.request(token_url, headers, HTTPClient.METHOD_POST, body)
 		if err == OK:
 			response = await _http.request_completed
+			attempt.elapsed_ms = Time.get_ticks_msec() - run_started_ms - attempt.offset_ms
 			if not is_instance_valid(_http):
 				result.error = "HTTPRequest freed mid-await (node shutdown?)"
 				exchange_completed.emit(result)
 				return result
-			var status_code: int = int(response[1]) if response.size() >= 2 else 0
-			if not (status_code == 0 or status_code >= 500):
+			attempt.transport_result = int(response[0]) if response.size() >= 1 else -1
+			attempt.http_status = int(response[1]) if response.size() >= 2 else 0
+			if not (attempt.http_status == 0 or attempt.http_status >= 500):
 				break
+		else:
+			attempt.submit_error = err
+			attempt.elapsed_ms = Time.get_ticks_msec() - run_started_ms - attempt.offset_ms
 		if last:
 			if err != OK:
 				result.error = "HTTPRequest.request err=%d" % err
@@ -119,9 +192,9 @@ func exchange(grant_type: String, extra_fields: Dictionary, client_id: String) -
 				exchange_completed.emit(result)
 				return result
 			break
-		var delay: float = minf(max_retry_delay_seconds, base_retry_delay_seconds * pow(2.0, float(attempt)))
+		var delay: float = minf(max_retry_delay_seconds, base_retry_delay_seconds * pow(2.0, float(attempt_index)))
 		push_warning("[SpacetimeAuth] transient failure (attempt %d/%d), retry in %.1fs" % [
-			attempt + 1, max_attempts, delay,
+			attempt_index + 1, max_attempts, delay,
 		])
 		await get_tree().create_timer(delay).timeout
 
@@ -134,20 +207,22 @@ func exchange(grant_type: String, extra_fields: Dictionary, client_id: String) -
 	var transport_result: int = int(response[0])
 	var code: int = int(response[1])
 	var body_str: String = PackedByteArray(response[3]).get_string_from_utf8()
-	_print_log("response: transport=%d HTTP=%d" % [transport_result, code])
+	_print_log("response: transport=%s(%d) HTTP=%d after %d attempt(s)" % [
+		transport_result_name(transport_result), transport_result, code, result.attempts.size(),
+	])
 
-	# code == 0 means no HTTP response was produced; translate the transport enum
-	# so logs read "CANT_CONNECT" rather than an opaque "HTTP 0".
+	# code == 0 means no HTTP response was produced; name the transport enum so
+	# logs read "CANT_CONNECT" rather than an opaque "HTTP 0".
 	if code == 0:
 		result.error = "transport error: %s (HTTPRequest.Result=%d)" % [
-			_transport_result_name(transport_result), transport_result,
+			transport_result_name(transport_result), transport_result,
 		]
 		exchange_completed.emit(result)
 		return result
 
 	if code != 200:
-		var redacted: String = _redact_credentials(body_str)
-		result.error = "HTTP %d: %s" % [code, redacted]
+		result.response_body = _redact_credentials(body_str)
+		result.error = "HTTP %d: %s" % [code, result.response_body]
 		exchange_completed.emit(result)
 		return result
 
@@ -165,10 +240,9 @@ func exchange(grant_type: String, extra_fields: Dictionary, client_id: String) -
 	return result
 
 
-# Best-effort scrub of credential-bearing fields from a body before logging it.
-# Handles JSON objects (`"field": "..."` -> `"field": "<redacted>"`) and
-# url-encoded form bodies (`field=...` -> `field=<redacted>`). Not a security
-# boundary — just keeps single-use tickets / tokens out of log files.
+# Scrubs credential fields from a body before it is logged, in both JSON and
+# url-encoded form. Best-effort, NOT a security boundary — it just keeps
+# single-use tickets and tokens out of log files.
 func _redact_credentials(body: String) -> String:
 	var redacted: String = body
 	for field: String in redact_fields:
@@ -181,7 +255,9 @@ func _redact_credentials(body: String) -> String:
 	return redacted
 
 
-static func _transport_result_name(rc: int) -> String:
+## Readable name for an `HTTPRequest.Result`. Public so consumers explaining a
+## transport failure don't each keep a copy of this table.
+static func transport_result_name(rc: int) -> String:
 	match rc:
 		HTTPRequest.RESULT_SUCCESS: return "SUCCESS"
 		HTTPRequest.RESULT_CHUNKED_BODY_SIZE_MISMATCH: return "CHUNKED_BODY_SIZE_MISMATCH"
