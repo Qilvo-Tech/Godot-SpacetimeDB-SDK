@@ -23,8 +23,8 @@ func _init(p_module_name: String, p_schema_path: String = "res://spacetime_bindi
 	load_table_types()
 
 func _load_files(path: String, dict:Dictionary[StringName, GDScript], is_core: bool = false) -> void:
-	var files := ResourceLoader.list_directory(path)
-	var dirs := DirAccess.get_directories_at(path)
+	var files: PackedStringArray = DirAccess.get_files_at(path)
+	var dirs: PackedStringArray = DirAccess.get_directories_at(path)
 	if files.is_empty() and dirs.is_empty():
 		printerr("SpacetimeDBSchema: Schema directory does not exist: ", path)
 		return
@@ -35,7 +35,8 @@ func _load_files(path: String, dict:Dictionary[StringName, GDScript], is_core: b
 	for dir_name in dirs:
 		_load_files(path.path_join(dir_name), dict, is_core)
 
-	for file_name in files:
+	for listed_file: String in files:
+		var file_name: String = listed_file.trim_suffix(".remap")
 		#skip non script files
 		if not file_name.ends_with(".gd"):
 			if debug_mode and not file_name.ends_with(".uid"):
