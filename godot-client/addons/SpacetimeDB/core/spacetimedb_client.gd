@@ -67,6 +67,7 @@ signal row_updated(table_name: String, old_row: Resource, new_row: Resource)
 signal row_deleted(table_name: String, row: Resource)
 signal row_transactions_completed(table_name: String)
 signal cache_batch_applied(batch: SpacetimeDBCacheBatch)
+signal cache_batch_completed(batch: SpacetimeDBCacheBatch)
 
 signal reducer_call_sent(request_id: int)
 signal reducer_call_response(response: ReducerResultMessage)
@@ -116,6 +117,7 @@ func initialize_and_connect():
 	_local_db.row_deleted.connect(func(tn, r) -> void: row_deleted.emit(tn, r))
 	_local_db.row_transactions_completed.connect(func(tn) -> void: row_transactions_completed.emit(tn))
 	_local_db.cache_batch_applied.connect(func(batch: SpacetimeDBCacheBatch) -> void: cache_batch_applied.emit(batch))
+	_local_db.cache_batch_completed.connect(func(batch: SpacetimeDBCacheBatch) -> void: cache_batch_completed.emit(batch))
 	_local_db.name = "LocalDatabase"
 	add_child(_local_db) # Add as child if it needs signals
 

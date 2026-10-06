@@ -23,6 +23,8 @@ class OfflineClient extends SpacetimeDBClient:
 var _client: OfflineClient
 var _db: LocalDatabase
 var _batches: Array[SpacetimeDBCacheBatch] = []
+var _completed_batches: Array[SpacetimeDBCacheBatch] = []
+var _completed_traces: Array[Array] = []
 var _trace: Array[String] = []
 var _checks: Array[Dictionary] = []
 var _failures: int = 0
@@ -44,6 +46,7 @@ func _run() -> void:
 	_check("offline initialization avoids network and workers", _client.token_connect_skipped
 		and not _client._connection._connection_requested and _client.deserializer_worker == null)
 	_client.cache_batch_applied.connect(_on_batch)
+	_client.cache_batch_completed.connect(_on_completed)
 	_client.row_inserted.connect(func(table_name: String, _row: Resource) -> void:
 		_trace.append(table_name + ":signal-insert"))
 	_client.row_updated.connect(func(table_name: String, _old_row: Resource, _new_row: Resource) -> void:
@@ -77,6 +80,8 @@ func _run() -> void:
 	_check("snapshot callback order unchanged", _trace == ["batch:7:0", "nearby:insert", "nearby:signal-insert",
 		"nearby:complete", "nearby:signal-complete", "own:insert", "own:signal-insert",
 		"own:complete", "own:signal-complete"])
+	_check("paired snapshot completion follows every raw callback", _completed_batches[-1] == _last_batch()
+		and _completed_traces[-1] == _trace)
 
 	_trace.clear()
 	var nearby_after: FixtureRow = FixtureRow.new(1, 20)
@@ -94,6 +99,8 @@ func _run() -> void:
 	_check("replacement callback order unchanged", _trace == ["batch:7:1", "nearby:update", "nearby:signal-update",
 		"nearby:complete", "nearby:signal-complete", "own:update", "own:signal-update",
 		"own:complete", "own:signal-complete"])
+	_check("paired transaction completion follows every raw callback", _completed_batches[-1] == _last_batch()
+		and _completed_traces[-1] == _trace)
 	_expected_nearby = null
 	_expected_own = null
 
@@ -123,6 +130,7 @@ func _run() -> void:
 	_check("leave scope includes deletion absent from retained cache", _last_batch().query_set_id == 9
 		and _last_batch().phase == SpacetimeDBCacheBatch.Phase.UNSUBSCRIBE
 		and _last_batch().tables[0].deletes == [listenerless_new] and _trace == ["batch:9:2"])
+	_check("paired leave uses exact applied payload", _completed_batches[-1] == _last_batch())
 
 	_trace.clear()
 	var subscription: SpacetimeDBSubscription = SpacetimeDBSubscription.create(_client, 44, [])
@@ -135,12 +143,16 @@ func _run() -> void:
 	_client._handle_parsed_message(empty_snapshot)
 	_check("empty snapshot identifies scope before applied callback", _last_batch().tables.is_empty()
 		and _trace == ["batch:44:0", "subscription-applied"] and subscription.active)
+	_check("empty snapshot completion precedes subscription applied", _completed_batches[-1] == _last_batch()
+		and _completed_traces[-1] == ["batch:44:0"])
 	_trace.clear()
 	var empty_leave: UnsubscribeAppliedMessage = UnsubscribeAppliedMessage.new()
 	empty_leave.query_id.id = 44
 	_client._handle_parsed_message(empty_leave)
 	_check("empty leave identifies scope before end callback", _last_batch().tables.is_empty()
 		and _trace == ["batch:44:2", "subscription-ended"] and subscription.ended)
+	_check("empty leave completion precedes subscription end", _completed_batches[-1] == _last_batch()
+		and _completed_traces[-1] == ["batch:44:2"])
 
 	_trace.clear()
 	var event: FixtureRow = FixtureRow.new(3, 50)
@@ -159,6 +171,8 @@ func _run() -> void:
 		and _batches[-2].tables[0].inserts[0].get("value") == 60
 		and _last_batch().tables[0].updates[0].old_row.get("value") == 60
 		and _db.get_row_by_pk("nearby", 4).get("value") == 70)
+	_check("each query-set completion precedes transaction final", _completed_batches[-2] == _batches[-2]
+		and _completed_batches[-1] == _last_batch() and _completed_traces[-1] == ["batch:31:1", "batch:32:1"])
 
 	_trace.clear()
 	var one_off: DatabaseUpdateData = DatabaseUpdateData.new()
@@ -166,6 +180,7 @@ func _run() -> void:
 	_db.apply_database_update(one_off)
 	_check("saved one-off synthetic update has explicit no-query scope", _last_batch().query_set_id == SpacetimeDBCacheBatch.NO_QUERY_SET
 		and _last_batch().phase == SpacetimeDBCacheBatch.Phase.TRANSACTION and _trace == ["batch:-1:1"])
+	_check("saved one-off receives paired completion", _completed_batches[-1] == _last_batch())
 
 	var batches_before_clear: int = _batches.size()
 	_db.clear_local_db()
@@ -188,6 +203,10 @@ func _on_batch(batch: SpacetimeDBCacheBatch) -> void:
 		_check("batch sees complete nearby cache", _db.get_row_by_pk("nearby", 1) == _expected_nearby)
 	if _expected_own != null:
 		_check("batch sees complete own cache", _db.get_row_by_pk("own", 1) == _expected_own)
+
+func _on_completed(batch: SpacetimeDBCacheBatch) -> void:
+	_completed_batches.append(batch)
+	_completed_traces.append(_trace.duplicate())
 
 func _on_insert(_row: _ModuleTableType, table_name: StringName) -> void:
 	_trace.append(String(table_name) + ":insert")

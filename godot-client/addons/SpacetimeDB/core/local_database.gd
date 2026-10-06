@@ -20,6 +20,8 @@ signal row_deleted(table_name: String, row: _ModuleTableType)
 signal row_transactions_completed(table_name: String)
 ## All tables in one query set have been applied; raw callbacks have not run yet.
 signal cache_batch_applied(batch: SpacetimeDBCacheBatch)
+## Paired with cache_batch_applied after all raw row and completion callbacks.
+signal cache_batch_completed(batch: SpacetimeDBCacheBatch)
 
 func _init(p_schema: SpacetimeDBSchema, module:SpacetimeDBClient):
 	# Initialize _tables dictionary with known table names
@@ -122,6 +124,7 @@ func apply_database_subscription_applied(db_update:SubscribeAppliedMessage):
 		batch.tables.append(table_changes)
 	cache_batch_applied.emit(batch)
 	emit_db_callbacks(changes)
+	cache_batch_completed.emit(batch)
 
 func apply_database_unsubscription_applied(db_update:UnsubscribeAppliedMessage):
 	if not db_update: return
@@ -135,6 +138,7 @@ func apply_database_unsubscription_applied(db_update:UnsubscribeAppliedMessage):
 		batch.tables.append(table_changes)
 	cache_batch_applied.emit(batch)
 	emit_db_callbacks(changes)
+	cache_batch_completed.emit(batch)
 
 func apply_database_update(db_update: DatabaseUpdateData):
 	if not db_update: return
@@ -149,6 +153,7 @@ func apply_database_update(db_update: DatabaseUpdateData):
 		batch.tables.append(table_changes)
 	cache_batch_applied.emit(batch)
 	emit_db_callbacks(changes)
+	cache_batch_completed.emit(batch)
 
 func _batch_table_changes(table_update: TableUpdateData) -> SpacetimeDBCacheBatch.TableChanges:
 	var table_changes: SpacetimeDBCacheBatch.TableChanges = SpacetimeDBCacheBatch.TableChanges.new(
