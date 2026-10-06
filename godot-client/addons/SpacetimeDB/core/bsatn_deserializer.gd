@@ -185,6 +185,22 @@ func read_vec_u8(spb: StreamPeerBuffer) -> PackedByteArray:
 		return PackedByteArray()
 	if length == 0: return PackedByteArray()
 	return read_bytes(spb, length)
+
+
+func read_vec_f32(spb: StreamPeerBuffer) -> Array[float]:
+	var start_pos: int = spb.get_position()
+	var length: int = read_u32_le(spb)
+	var result: Array[float] = []
+	if has_error():
+		return result
+	var byte_length: int = length * 4
+	if byte_length > MAX_BYTE_ARRAY_LEN:
+		_set_error("Vec<f32> byte length %d exceeds limit %d" % [byte_length, MAX_BYTE_ARRAY_LEN], start_pos)
+		return result
+	var bytes: PackedByteArray = read_bytes(spb, byte_length)
+	if not has_error():
+		result.assign(Array(bytes.to_float32_array()))
+	return result
 #endregion
 
 
@@ -681,7 +697,12 @@ func _read_one_off_query_message(spb: StreamPeerBuffer)-> OneOffQueryResponseMes
 	return response_res
 
 func _parse_generic_type(spb:StreamPeerBuffer, bsatn_type:StringName)-> Variant:
-	if bsatn_type.begins_with("opt_"):
+	# Large primitive vectors must bypass recursive per-element dispatch.
+	if bsatn_type == &"vec_U8":
+		return read_vec_u8(spb)
+	elif bsatn_type == &"vec_F32":
+		return read_vec_f32(spb)
+	elif bsatn_type.begins_with("opt_"):
 		return _read_option(spb, bsatn_type.trim_prefix("opt_"))
 	elif bsatn_type.begins_with("vec_"):
 		var result_type_array: Array = []
