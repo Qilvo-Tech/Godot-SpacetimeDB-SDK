@@ -262,7 +262,7 @@ func _thread_loop() -> void:
 			_result_mutex.unlock()
 
 
-func _process_results_asynchronously():
+func _process_results_asynchronously() -> void:
 	if use_threading and not _result_mutex:
 		printerr("SpacetimeDBClient: Threading setup corrupted: _result_mutex missing")
 		return
@@ -272,15 +272,17 @@ func _process_results_asynchronously():
 	if _result_queue.is_empty():
 		if use_threading: _result_mutex.unlock()
 		return
-	# shallow copy the queue to reduce block time.
-	var result_queue_copy := _result_queue.duplicate()
-	_result_queue.clear()
+	# New worker results must queue separately while callbacks run.
+	var result_batch: Array[Resource] = _result_queue
+	_result_queue = []
 	if use_threading: _result_mutex.unlock()
 
-	while not result_queue_copy.is_empty():
-		_handle_parsed_message(result_queue_copy.pop_front())
-		if result_queue_copy.size() >= 1:
-			print_log("BSATN-Thread: result_queue: " + str(result_queue_copy.size()))
+	var messages_remaining: int = result_batch.size()
+	for message: Resource in result_batch:
+		_handle_parsed_message(message)
+		messages_remaining -= 1
+		if debug_mode and messages_remaining > 0:
+			print_log("BSATN-Thread: result_queue: " + str(messages_remaining))
 
 
 
@@ -328,7 +330,24 @@ func _on_packet_decode_failed(reason: String) -> void:
 func _parse_packet_and_get_resource(bsatn_bytes: PackedByteArray) -> Array[Resource]:
 	if not _deserializer or bsatn_bytes.is_empty(): return []
 
-	var result := _deserializer.process_bytes_and_extract_messages(bsatn_bytes)
+	var result: Array[Resource] = []
+	var stream: StreamPeerBuffer = StreamPeerBuffer.new()
+	stream.data_array = bsatn_bytes
+	while stream.get_position() < stream.get_size():
+		var message_start: int = stream.get_position()
+		var message: Resource = _deserializer._parse_message_from_stream(stream)
+		if _deserializer.has_error():
+			var error_message: String = _deserializer.get_last_error()
+			if not error_message.contains("past end of buffer"):
+				printerr("BSATNDeserializer: Unrecoverable parsing error: %s. Clearing buffer to prevent infinite loop." % error_message)
+			break
+		if message == null:
+			break
+		result.append(message)
+		if stream.get_position() == message_start:
+			printerr("BSATNDeserializer: Parser consumed 0 bytes. Clearing buffer to prevent infinite loop.")
+			printerr(stream.get_size() - message_start)
+			break
 
 	if _deserializer.has_error() or result.is_empty():
 		printerr("SpacetimeDBClient: Failed to parse BSATN packet: ", _deserializer.get_last_error())
