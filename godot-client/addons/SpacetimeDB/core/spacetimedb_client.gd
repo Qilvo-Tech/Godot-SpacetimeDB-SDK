@@ -14,6 +14,8 @@ class_name SpacetimeDBClient extends Node
 @export var debug_mode: bool = true
 @export var current_subscriptions: Dictionary[int, SpacetimeDBSubscription]
 @export var use_threading: bool = true
+## Maximum decoded bytes in one WebSocket packet, including coalesced v3 messages.
+@export var max_decompressed_packet_bytes: int = 8 * 1024 * 1024
 
 var deserializer_worker: Thread
 var _packet_queue: Array[PackedByteArray] = []
@@ -283,16 +285,48 @@ func _process_results_asynchronously():
 
 
 func _decompress_and_parse(raw_bytes: PackedByteArray) -> PackedByteArray:
-	var compression = raw_bytes[0]
-	var payload = raw_bytes.slice(1)
-	match compression:
-		0: pass
-		1: printerr("SpacetimeDBClient (Thread) : Brotli compression not supported!")
-		2: payload = DataDecompressor.decompress_packet(payload)
-	return payload
+	if max_decompressed_packet_bytes <= 0:
+		return _reject_packet("Decoded packet size limit must be positive")
+	if raw_bytes.size() < 2:
+		return _reject_packet("Empty server packet or payload")
+
+	var compression_tag: int = raw_bytes[0]
+	var payload: PackedByteArray = raw_bytes.slice(1)
+	var compression_mode: FileAccess.CompressionMode
+	match compression_tag:
+		SpacetimeDBConnection.CompressionPreference.NONE:
+			if payload.size() > max_decompressed_packet_bytes:
+				return _reject_packet("Server packet exceeds decoded size limit")
+			return payload
+		SpacetimeDBConnection.CompressionPreference.BROTLI:
+			compression_mode = FileAccess.COMPRESSION_BROTLI
+		SpacetimeDBConnection.CompressionPreference.GZIP:
+			compression_mode = FileAccess.COMPRESSION_GZIP
+		_:
+			return _reject_packet("Unknown server packet compression tag: %d" % compression_tag)
+
+	var decoded: PackedByteArray
+	if compression_mode == FileAccess.COMPRESSION_BROTLI:
+		# Godot 4.7.2's dynamic Brotli decoder hangs on truncated input; fixed decoding rejects it.
+		decoded = payload.decompress(max_decompressed_packet_bytes, compression_mode)
+	else:
+		decoded = payload.decompress_dynamic(max_decompressed_packet_bytes, compression_mode)
+	if decoded.is_empty():
+		return _reject_packet("Server packet decompression failed, is empty, or exceeds decoded size limit")
+	return decoded
+
+func _reject_packet(reason: String) -> PackedByteArray:
+	_on_packet_decode_failed.call_deferred(reason)
+	return PackedByteArray()
+
+func _on_packet_decode_failed(reason: String) -> void:
+	printerr("SpacetimeDBClient: ", reason)
+	connection_error.emit(ERR_PARSE_ERROR, reason)
+	if _connection != null and _connection.is_connected_db():
+		_connection.disconnect_from_server(1002, "Invalid server packet")
 
 func _parse_packet_and_get_resource(bsatn_bytes: PackedByteArray) -> Array[Resource]:
-	if not _deserializer: return []
+	if not _deserializer or bsatn_bytes.is_empty(): return []
 
 	var result := _deserializer.process_bytes_and_extract_messages(bsatn_bytes)
 

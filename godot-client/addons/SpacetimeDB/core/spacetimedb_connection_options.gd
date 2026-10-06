@@ -1,10 +1,8 @@
 class_name SpacetimeDBConnectionOptions extends Resource
 ## helper class for the Websocket connection builder.
 
-## Brotli not supported yet
 const CompressionPreference = SpacetimeDBConnection.CompressionPreference
 
-## Brotli not supported yet
 var compression: CompressionPreference = CompressionPreference.NONE
 ## Use a thread for the BSATN parsing. Adds 1-2 frames delay.
 var threading: bool = true
