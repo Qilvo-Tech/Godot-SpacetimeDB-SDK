@@ -18,6 +18,8 @@ signal row_inserted(table_name: String, row: _ModuleTableType)
 signal row_updated(table_name: String, old_row: _ModuleTableType, new_row: _ModuleTableType)
 signal row_deleted(table_name: String, row: _ModuleTableType)
 signal row_transactions_completed(table_name: String)
+## All tables in one query set have been applied; raw callbacks have not run yet.
+signal cache_batch_applied(batch: SpacetimeDBCacheBatch)
 
 func _init(p_schema: SpacetimeDBSchema, module:SpacetimeDBClient):
 	# Initialize _tables dictionary with known table names
@@ -111,26 +113,49 @@ func get_is_event(table_name_original: StringName) -> bool:
 func apply_database_subscription_applied(db_update:SubscribeAppliedMessage):
 	if not db_update: return
 	var changes:Array[Dictionary] = []
+	var batch: SpacetimeDBCacheBatch = SpacetimeDBCacheBatch.new(
+		db_update.query_id.id, SpacetimeDBCacheBatch.Phase.SNAPSHOT)
 	for table_update: TableUpdateData in db_update.tables:
-		var updates = apply_table_update(table_update)
+		var table_changes: SpacetimeDBCacheBatch.TableChanges = _batch_table_changes(table_update)
+		var updates: Dictionary[String, Array] = apply_table_update(table_update, table_changes)
 		changes.append(updates)
+		batch.tables.append(table_changes)
+	cache_batch_applied.emit(batch)
 	emit_db_callbacks(changes)
 
 func apply_database_unsubscription_applied(db_update:UnsubscribeAppliedMessage):
 	if not db_update: return
 	var changes:Array[Dictionary] = []
+	var batch: SpacetimeDBCacheBatch = SpacetimeDBCacheBatch.new(
+		db_update.query_id.id, SpacetimeDBCacheBatch.Phase.UNSUBSCRIBE)
 	for table_update: TableUpdateData in db_update.tables:
-		var updates = apply_table_update(table_update)
+		var table_changes: SpacetimeDBCacheBatch.TableChanges = _batch_table_changes(table_update)
+		var updates: Dictionary[String, Array] = apply_table_update(table_update, table_changes)
 		changes.append(updates)
+		batch.tables.append(table_changes)
+	cache_batch_applied.emit(batch)
 	emit_db_callbacks(changes)
 
 func apply_database_update(db_update: DatabaseUpdateData):
 	if not db_update: return
 	var changes:Array[Dictionary] = []
+	var query_set_id: int = db_update.query_id.id if db_update.query_id != null else SpacetimeDBCacheBatch.NO_QUERY_SET
+	var batch: SpacetimeDBCacheBatch = SpacetimeDBCacheBatch.new(
+		query_set_id, SpacetimeDBCacheBatch.Phase.TRANSACTION)
 	for table_update: TableUpdateData in db_update.tables:
-		var updates = apply_table_update(table_update)
+		var table_changes: SpacetimeDBCacheBatch.TableChanges = _batch_table_changes(table_update)
+		var updates: Dictionary[String, Array] = apply_table_update(table_update, table_changes)
 		changes.append(updates)
+		batch.tables.append(table_changes)
+	cache_batch_applied.emit(batch)
 	emit_db_callbacks(changes)
+
+func _batch_table_changes(table_update: TableUpdateData) -> SpacetimeDBCacheBatch.TableChanges:
+	var table_changes: SpacetimeDBCacheBatch.TableChanges = SpacetimeDBCacheBatch.TableChanges.new(
+		StringName(table_update.table_name.to_snake_case()))
+	table_changes.inserts.assign(table_update.inserts)
+	table_changes.deletes.assign(table_update.deletes)
+	return table_changes
 
 func emit_db_callbacks(changes:Array[Dictionary]):
 	for change in changes:
@@ -173,7 +198,7 @@ func emit_db_callbacks(changes:Array[Dictionary]):
 				listener.call()
 			row_transactions_completed.emit(table_name)
 
-func apply_table_update(table_update: TableUpdateData) -> Dictionary[String,Array]:
+func apply_table_update(table_update: TableUpdateData, batch_changes: SpacetimeDBCacheBatch.TableChanges = null) -> Dictionary[String,Array]:
 	var table_name_original: StringName = StringName(table_update.table_name.to_snake_case())
 
 	if not _tables.has(table_name_original):
@@ -221,6 +246,8 @@ func apply_table_update(table_update: TableUpdateData) -> Dictionary[String,Arra
 		var prev_row_resource: _ModuleTableType = table_dict.get(pk_value, null)
 		table_dict[pk_value] = inserted_row
 		if prev_row_resource != null:
+			if batch_changes != null:
+				batch_changes.updates.append(SpacetimeDBCacheBatch.RowUpdate.new(prev_row_resource, inserted_row))
 			if _update_listeners_by_table.has(table_name_original):
 				updates_to_emit.append([prev_row_resource,inserted_row])
 		else:
