@@ -218,7 +218,9 @@ func _read_option(spb: StreamPeerBuffer, bsatn_type_str: StringName) -> Option:
 		option_instance.set_none()
 		return option_instance
 	elif is_present_tag == 0: # It's Some
-		option_instance.set_some(_parse_generic_type(spb,bsatn_type_str))
+		var value: Variant = _parse_generic_type(spb, bsatn_type_str)
+		if has_error(): return null
+		option_instance.set_some(value)
 		return option_instance
 	else:
 		_set_error("Invalid tag %d for Option bsatn_type '%s' (expected 0 for Some, 1 for None)." % [is_present_tag, bsatn_type_str])
@@ -254,8 +256,6 @@ func _read_native_arraylike(spb: StreamPeerBuffer, bsatn_type: StringName) -> Va
 	for bsatn_component_type_str in bsatn_types_for_components.split(","):
 		var component_value = _parse_generic_type(spb, bsatn_component_type_str)
 		if has_error():
-			printerr("failed to read native_arraylike with error: %s" % get_last_error())
-			clear_error()
 			return null
 		components.append(component_value)
 	match bsatn_type:
@@ -352,15 +352,15 @@ func _get_primitive_reader_from_bsatn_type(bsatn_type_str: StringName) -> Callab
 func _populate_enum_from_bytes(spb: StreamPeerBuffer, resource: Resource) -> void:
 	var enum_types: Array = resource["enum_options"]
 	var pos = spb.get_position()
-	var enum_variant: int = spb.get_u8()
+	var enum_variant: int = read_u8(spb)
+	if has_error(): return
 	resource.value = enum_variant
 	var bsatn_type = enum_types[enum_variant]
 	if bsatn_type.is_empty():
 		return
 	var data = _parse_generic_type(spb, bsatn_type)
 	if has_error():
-		printerr("enum failed with error: %s" % get_last_error())
-		clear_error()
+		return
 	if data:
 		resource.data = data
 
@@ -429,6 +429,8 @@ func _read_table_update_instance(spb: StreamPeerBuffer) -> TableUpdateData:
 
 	var all_parsed_inserts: Array[Resource] = []
 	var all_parsed_deletes: Array[Resource] = []
+	var insert_keys: Array[String] = []
+	var delete_keys: Array[String] = []
 	var table_type: StringName = _schema.get_type_of_table_name(resource.table_name)
 	var row_spb := StreamPeerBuffer.new()
 
@@ -455,14 +457,13 @@ func _read_table_update_instance(spb: StreamPeerBuffer) -> TableUpdateData:
 			row_spb.data_array = raw_row_bytes
 			var row_resource = _parse_generic_type(row_spb, table_type)
 			if has_error():
-				printerr("row skipped with error: %s" % get_last_error())
-				clear_error()
-				continue
+				return null
 			if row_resource:
 				all_parsed_inserts.append(row_resource)
+				insert_keys.append(raw_row_bytes.hex_encode())
 			else:
-				push_error("Stopping v2 table update for table '%s' due to delete row parsing failure." % resource.table_name)
-				break
+				_set_error("Failed to parse row for table '%s'" % resource.table_name, row_spb.get_position())
+				return null
 		if has_error(): break
 		#if not row_schema_script: ????
 			#continue  # Already consumed bytes above
@@ -470,14 +471,13 @@ func _read_table_update_instance(spb: StreamPeerBuffer) -> TableUpdateData:
 			row_spb.data_array = raw_row_bytes
 			var row_resource = _parse_generic_type(row_spb, table_type)
 			if has_error():
-				printerr("row skipped with error: %s" % get_last_error())
-				clear_error()
-				continue
+				return null
 			if row_resource:
 				all_parsed_deletes.append(row_resource)
+				delete_keys.append(raw_row_bytes.hex_encode())
 			else:
-				push_error("Stopping v2 table update for table '%s' due to delete row parsing failure." % resource.table_name)
-				break
+				_set_error("Failed to parse row for table '%s'" % resource.table_name, row_spb.get_position())
+				return null
 
 
 		if has_error(): break
@@ -486,6 +486,8 @@ func _read_table_update_instance(spb: StreamPeerBuffer) -> TableUpdateData:
 	resource.num_rows = all_parsed_inserts.size() + all_parsed_deletes.size()
 	resource.inserts.assign(all_parsed_inserts)
 	resource.deletes.assign(all_parsed_deletes)
+	resource.insert_row_keys.assign(insert_keys)
+	resource.delete_row_keys.assign(delete_keys)
 	return resource
 
 # Manual reader specifically for SubscriptionErrorMessage due to Option<T> fields
@@ -588,13 +590,13 @@ func _read_subscripton_applied_message(spb: StreamPeerBuffer) -> SubscribeApplie
 				row_spb.seek(0)
 				var row_resource: Resource = _parse_generic_type(row_spb, table_type)
 				if has_error():
-					printerr("row skipped with error: %s" % get_last_error())
-					clear_error()
-					continue
+					return null
 				if row_resource:
 					parsed_inserts.append(row_resource)
+					table_data.insert_row_keys.append(raw_row_bytes.hex_encode())
 				else:
-					push_error("SubscribeApplied: failed to parse row for table '%s'" % table_name)
+					_set_error("Failed to parse row for table '%s'" % table_name, row_spb.get_position())
+					return null
 		else:
 			if debug_mode: push_warning("SubscribeApplied: No schema for table '%s', skipping row parse." % table_name)
 		table_data.inserts.assign(parsed_inserts)
@@ -636,13 +638,13 @@ func _read_unsubscription_applied_message(spb: StreamPeerBuffer) -> UnsubscribeA
 					row_spb.seek(0)
 					var row_resource: Resource = _parse_generic_type(row_spb, table_type)
 					if has_error():
-						printerr("row skipped with error: %s" % get_last_error())
-						clear_error()
-						continue
+						return null
 					if row_resource:
 						parsed_deletes.append(row_resource)
+						table_data.delete_row_keys.append(raw_row_bytes.hex_encode())
 					else:
-						push_error("SubscribeApplied: failed to parse row for table '%s'" % table_name)
+						_set_error("Failed to parse row for table '%s'" % table_name, row_spb.get_position())
+						return null
 			else:
 				push_warning("SubscribeApplied: No schema for table '%s', skipping row parse." % table_name)
 			table_data.deletes.assign(parsed_deletes)
@@ -679,13 +681,13 @@ func _read_one_off_query_message(spb: StreamPeerBuffer)-> OneOffQueryResponseMes
 					row_spb.seek(0)
 					var row_resource: Resource = _parse_generic_type(row_spb, table_type)
 					if has_error():
-						printerr("row skipped with error: %s" % get_last_error())
-						clear_error()
-						continue
+						return null
 					if row_resource:
 						parsed_inserts.append(row_resource)
+						table_data.insert_row_keys.append(raw_row_bytes.hex_encode())
 					else:
-						push_error("SubscribeApplied: failed to parse row for table '%s'" % table_name)
+						_set_error("Failed to parse row for table '%s'" % table_name, row_spb.get_position())
+						return null
 			else:
 				if debug_mode: push_warning("SubscribeApplied: No schema for table '%s', skipping row parse." % table_name)
 			table_data.inserts.assign(parsed_inserts)
@@ -697,6 +699,7 @@ func _read_one_off_query_message(spb: StreamPeerBuffer)-> OneOffQueryResponseMes
 	return response_res
 
 func _parse_generic_type(spb:StreamPeerBuffer, bsatn_type:StringName)-> Variant:
+	if has_error(): return null
 	# Large primitive vectors must bypass recursive per-element dispatch.
 	if bsatn_type == &"vec_U8":
 		return read_vec_u8(spb)
@@ -706,9 +709,12 @@ func _parse_generic_type(spb:StreamPeerBuffer, bsatn_type:StringName)-> Variant:
 		return _read_option(spb, bsatn_type.trim_prefix("opt_"))
 	elif bsatn_type.begins_with("vec_"):
 		var result_type_array: Array = []
-		var count = read_u32_le(spb)
+		var count: int = read_u32_le(spb)
+		if has_error(): return null
 		for _i in count:
-			result_type_array.append(_parse_generic_type(spb, bsatn_type.trim_prefix("vec_")))
+			var value: Variant = _parse_generic_type(spb, bsatn_type.trim_prefix("vec_"))
+			if has_error(): return null
+			result_type_array.append(value)
 		return result_type_array
 	elif bsatn_type.begins_with("ret_"):
 		return _read_result(spb, bsatn_type.trim_prefix("ret_"))
@@ -733,21 +739,28 @@ func _parse_generic_type(spb:StreamPeerBuffer, bsatn_type:StringName)-> Variant:
 	if not script:
 		_set_error("script: %s is empty or can't instantiate" % script)
 
+	if has_error(): return null
 	var result_resource := script.new()
 	if result_resource is RustEnum:
 		# error handling?
 		_populate_enum_from_bytes(spb,result_resource)
+		if has_error(): return null
 		return result_resource
 
 	for prop: StringName in result_resource.BSATN_TYPES.keys():
 		var bsatn_type_str: StringName = result_resource.BSATN_TYPES.get(prop)
 		var reader_callablce := _get_primitive_reader_from_bsatn_type(bsatn_type_str)
 		if reader_callablce.is_valid():
-			result_resource[prop] = reader_callablce.call(spb)
+			var value: Variant = reader_callablce.call(spb)
+			if has_error(): return null
+			result_resource[prop] = value
 		elif _schema.module_types.has(bsatn_type_str) or _schema.core_types.has(bsatn_type_str) or bsatn_type_str.begins_with("opt_") or bsatn_type_str.begins_with("ret_") or NATIVE_ARRAYLIKE.has(bsatn_type_str):
-			result_resource[prop] = _parse_generic_type(spb, bsatn_type_str)
+			var value: Variant = _parse_generic_type(spb, bsatn_type_str)
+			if has_error(): return null
+			result_resource[prop] = value
 		elif bsatn_type_str.begins_with("vec_"):
-			var result_type_array = _parse_generic_type(spb, bsatn_type_str)
+			var result_type_array: Variant = _parse_generic_type(spb, bsatn_type_str)
+			if has_error(): return null
 			var temp_arr = result_resource[prop]
 			temp_arr.append_array(result_type_array)
 			result_resource[prop] = temp_arr

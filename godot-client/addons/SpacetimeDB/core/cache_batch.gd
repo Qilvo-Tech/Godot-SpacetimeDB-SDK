@@ -15,11 +15,11 @@ class RowUpdate extends RefCounted:
 
 class TableChanges extends RefCounted:
 	var table_name: StringName
-	## Decoded wire rows, including rows already retained or removed by another set.
-	## Row resources are borrowed from the raw cache and must not be mutated.
+	## Borrowed decoded rows; raw parts retain occurrences, scoped deltas contain zero-crossings.
+	## Row resources must not be mutated.
 	var inserts: Array[_ModuleTableType] = []
 	var deletes: Array[_ModuleTableType] = []
-	## Cache replacements; each new_row is also present in inserts.
+	## Global replacements on raw parts; scoped replacements on query_set_changes.
 	var updates: Array[RowUpdate] = []
 
 	func _init(p_table_name: StringName) -> void:
@@ -27,7 +27,11 @@ class TableChanges extends RefCounted:
 
 var query_set_id: int
 var phase: Phase
+## Raw decoded wire parts, preserving duplicate occurrences and order.
 var tables: Array[TableChanges] = []
+## Per-set version-presence changes, independent of other sets' retention.
+## Scoped replacement rows also appear in these inserts/deletes for source consumers.
+var query_set_changes: Array[TableChanges] = []
 
 func _init(p_query_set_id: int, p_phase: Phase) -> void:
 	query_set_id = p_query_set_id

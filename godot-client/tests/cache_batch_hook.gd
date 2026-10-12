@@ -64,7 +64,8 @@ func _run() -> void:
 		_db.subscribe_to_transactions_completed(table_name, _on_complete.bind(table_name))
 
 	var retained: FixtureRow = FixtureRow.new(99, 999)
-	_db._tables[&"nearby"][retained.id] = retained
+	_snapshot(6, [_table("nearby", [retained])])
+	_trace.clear()
 	var nearby_before: FixtureRow = FixtureRow.new(1, 10)
 	var own_before: FixtureRow = FixtureRow.new(1, 100)
 	_expected_nearby = nearby_before
@@ -108,6 +109,7 @@ func _run() -> void:
 	_db.unsubscribe_from_updates(&"nearby", _on_update.bind(&"nearby"))
 	_db.unsubscribe_from_deletes(&"nearby", _on_delete.bind(&"nearby"))
 	_db.unsubscribe_from_transactions_completed(&"nearby", _on_complete.bind(&"nearby"))
+	_snapshot(9, [])
 	_trace.clear()
 	var listenerless: FixtureRow = FixtureRow.new(2, 30)
 	_db.apply_database_update(_transaction(9, [_table("nearby", [listenerless])]))
@@ -154,6 +156,7 @@ func _run() -> void:
 	_check("empty leave completion precedes subscription end", _completed_batches[-1] == _last_batch()
 		and _completed_traces[-1] == ["batch:44:2"])
 
+	_snapshot(20, [])
 	_trace.clear()
 	var event: FixtureRow = FixtureRow.new(3, 50)
 	_db.apply_database_update(_transaction(20, [_table("events", [event], [event])]))
@@ -162,17 +165,27 @@ func _run() -> void:
 		and _last_batch().tables[0].updates.is_empty())
 	_check("event callbacks retain original order", _trace == ["batch:20:1", "events:signal-insert", "events:signal-delete"])
 
+	var version60: FixtureRow = FixtureRow.new(4, 60)
+	var version70: FixtureRow = FixtureRow.new(4, 70)
+	_snapshot(31, [_table("nearby", [version60])])
+	_snapshot(32, [])
 	_trace.clear()
 	var sets: TransactionUpdateMessage = TransactionUpdateMessage.new()
-	sets.query_sets = [_transaction(31, [_table("nearby", [FixtureRow.new(4, 60)])]),
-		_transaction(32, [_table("nearby", [FixtureRow.new(4, 70)])])]
+	sets.query_sets = [_transaction(31, [_table("nearby", [], [version60])]),
+		_transaction(32, [_table("nearby", [version70])])]
 	_client._handle_transaction_update(sets)
-	_check("transaction preserves separate query-set scope and final callback", _trace == ["batch:31:1", "batch:32:1", "transaction-complete"]
-		and _batches[-2].tables[0].inserts[0].get("value") == 60
-		and _last_batch().tables[0].updates[0].old_row.get("value") == 60
-		and _db.get_row_by_pk("nearby", 4).get("value") == 70)
-	_check("each query-set completion precedes transaction final", _completed_batches[-2] == _batches[-2]
+	_check("transaction stages separate sets before final callback", _trace == ["batch:31:1", "batch:32:1", "transaction-complete"]
+		and _batches[-2].tables[0].deletes == [version60]
+		and _last_batch().tables[0].updates[0].old_row == version60
+		and _db.get_row_by_pk("nearby", 4) == version70)
+	_check("all applied hooks precede paired completions", _completed_batches[-2] == _batches[-2]
 		and _completed_batches[-1] == _last_batch() and _completed_traces[-1] == ["batch:31:1", "batch:32:1"])
+	var conflicting: TransactionUpdateMessage = TransactionUpdateMessage.new()
+	conflicting.query_sets = [_transaction(31, [_table("nearby", [version60])])]
+	var batches_before_reject: int = _batches.size()
+	_check("former conflicting live versions reject atomically", not _db.apply_transaction_update(conflicting)
+		and _batches.size() == batches_before_reject and _db.get_row_by_pk("nearby", 4) == version70)
+	_db.retire_all_query_sets()
 
 	_trace.clear()
 	var one_off: DatabaseUpdateData = DatabaseUpdateData.new()
@@ -228,7 +241,24 @@ func _table(table_name: String, inserts: Array[_ModuleTableType] = [], deletes: 
 	update.table_name = table_name
 	update.inserts.assign(inserts)
 	update.deletes.assign(deletes)
+	for row: _ModuleTableType in inserts:
+		update.insert_row_keys.append(_row_bytes(row).hex_encode())
+	for row: _ModuleTableType in deletes:
+		update.delete_row_keys.append(_row_bytes(row).hex_encode())
 	return update
+
+func _row_bytes(row: _ModuleTableType) -> PackedByteArray:
+	var stream: StreamPeerBuffer = StreamPeerBuffer.new()
+	stream.big_endian = false
+	stream.put_64(row.get(&"id"))
+	stream.put_64(row.get(&"value"))
+	return stream.data_array
+
+func _snapshot(query_set_id: int, tables: Array[TableUpdateData]) -> void:
+	var message: SubscribeAppliedMessage = SubscribeAppliedMessage.new()
+	message.query_id.id = query_set_id
+	message.tables = tables
+	_check("valid snapshot %d" % query_set_id, _db.apply_database_subscription_applied(message))
 
 func _transaction(query_set_id: int, tables: Array[TableUpdateData]) -> DatabaseUpdateData:
 	var update: DatabaseUpdateData = DatabaseUpdateData.new()

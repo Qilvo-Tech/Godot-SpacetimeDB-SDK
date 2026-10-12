@@ -17,10 +17,22 @@ class_name SpacetimeDBClient extends Node
 ## Maximum decoded bytes in one WebSocket packet, including coalesced v3 messages.
 @export var max_decompressed_packet_bytes: int = 8 * 1024 * 1024
 
+class ReceivedPacket extends RefCounted:
+	var generation: int
+	var bytes: PackedByteArray
+
+class ParsedDelivery extends RefCounted:
+	var generation: int
+	var message: Resource
+
+var _connection_generation: int = 0
+var _accepting_packets: bool = false
+var _session_ready: bool = false
+
 var deserializer_worker: Thread
-var _packet_queue: Array[PackedByteArray] = []
+var _packet_queue: Array[ReceivedPacket] = []
 var _packet_semaphore: Semaphore
-var _result_queue: Array[Resource] = []
+var _result_queue: Array[ParsedDelivery] = []
 var _result_mutex: Mutex
 var _packet_mutex: Mutex
 var _thread_should_exit: bool = false
@@ -130,8 +142,8 @@ func initialize_and_connect():
 
 	# 5. Initialize Connection Handler
 	_connection = SpacetimeDBConnection.new(connection_options, database_name)
-	_connection.disconnected.connect(func(): disconnected.emit())
-	_connection.connection_error.connect(func(c, r): connection_error.emit(c, r))
+	_connection.disconnected.connect(_on_transport_disconnected)
+	_connection.connection_error.connect(_on_transport_error)
 	_connection.message_received.connect(_on_websocket_message_received)
 	_connection.name = "Connection"
 	add_child(_connection)
@@ -192,6 +204,7 @@ func _on_token_received(received_token: String):
 	_connection.set_token(self._token)
 	_rest_api.set_token(self._token) # REST API might also need it
 
+	_begin_connection_generation()
 	# Now attempt to connect WebSocket
 	_connection.connect_to_database(base_url, database_name, conn_id, connection_options.confirmed_reads)
 
@@ -228,17 +241,61 @@ func _process(_delta: float) -> void:
 	if use_threading and is_connected_db():
 		_process_results_asynchronously()
 
-func _on_websocket_message_received(raw_bytes: PackedByteArray):
-	if not _is_initialized: return
+func _invalidate_delivery() -> void:
+	_connection_generation += 1
+	_accepting_packets = false
+	_session_ready = false
+
+func _begin_connection_generation() -> void:
+	_invalidate_delivery()
+	_accepting_packets = true
+
+func _on_transport_disconnected() -> void:
+	_invalidate_delivery()
+	disconnected.emit()
+
+func _on_transport_error(code: int, reason: String) -> void:
+	_invalidate_delivery()
+	connection_error.emit(code, reason)
+
+func _reset_connection_cache() -> void:
+	for subscription: SpacetimeDBSubscription in current_subscriptions.values():
+		subscription._active = false
+		subscription._ended = true
+		subscription.queue_free()
+	for subscription: SpacetimeDBSubscription in _pending_subscriptions.values():
+		subscription._active = false
+		subscription._ended = true
+		subscription.queue_free()
+	current_subscriptions.clear()
+	_pending_subscriptions.clear()
+	_pending_one_off_query_callbacks.clear()
+	_local_db.retire_all_query_sets()
+	_local_db.retire_saved_rows()
+
+func _handle_delivery(message: Resource, generation: int) -> void:
+	if generation != _connection_generation or not _accepting_packets:
+		return
+	if not _session_ready and not message is IdentityTokenMessage:
+		return
+	_handle_parsed_message(message)
+
+func _on_websocket_message_received(raw_bytes: PackedByteArray) -> void:
+	if not _is_initialized or not _accepting_packets:
+		return
+	var generation: int = _connection_generation
 	if use_threading:
+		var packet: ReceivedPacket = ReceivedPacket.new()
+		packet.generation = generation
+		packet.bytes = raw_bytes
 		_packet_mutex.lock()
-		_packet_queue.append(raw_bytes)
+		_packet_queue.append(packet)
 		_packet_mutex.unlock()
 		_packet_semaphore.post()
 	else:
-		var messages := _parse_packet_and_get_resource(_decompress_and_parse(raw_bytes))
+		var messages: Array[Resource] = _parse_packet_and_get_resource(_decompress_and_parse(raw_bytes, generation), generation)
 		for message: Resource in messages:
-			_handle_parsed_message(message)
+			_handle_delivery(message, generation)
 
 func _thread_loop() -> void:
 	while not _thread_should_exit:
@@ -252,17 +309,20 @@ func _thread_loop() -> void:
 			continue
 		if _packet_queue.size() >1:
 			print_log("BSATN-Thread: package_queue: " + str(_packet_queue.size()))
-		var packet_to_process: PackedByteArray = _packet_queue.pop_front()
+		var packet_to_process: ReceivedPacket = _packet_queue.pop_front()
 		_packet_mutex.unlock()
 
 		var message_resources: Array[Resource]
-		var payload := _decompress_and_parse(packet_to_process)
-		message_resources = _parse_packet_and_get_resource(payload)
+		var payload := _decompress_and_parse(packet_to_process.bytes, packet_to_process.generation)
+		message_resources = _parse_packet_and_get_resource(payload, packet_to_process.generation)
 
 		if message_resources.size() >= 1:
 			_result_mutex.lock()
-			for message in message_resources:
-				_result_queue.append(message)
+			for message: Resource in message_resources:
+				var delivery: ParsedDelivery = ParsedDelivery.new()
+				delivery.generation = packet_to_process.generation
+				delivery.message = message
+				_result_queue.append(delivery)
 			_result_mutex.unlock()
 
 
@@ -277,24 +337,24 @@ func _process_results_asynchronously() -> void:
 		if use_threading: _result_mutex.unlock()
 		return
 	# New worker results must queue separately while callbacks run.
-	var result_batch: Array[Resource] = _result_queue
+	var result_batch: Array[ParsedDelivery] = _result_queue
 	_result_queue = []
 	if use_threading: _result_mutex.unlock()
 
 	var messages_remaining: int = result_batch.size()
-	for message: Resource in result_batch:
-		_handle_parsed_message(message)
+	for delivery: ParsedDelivery in result_batch:
+		_handle_delivery(delivery.message, delivery.generation)
 		messages_remaining -= 1
 		if debug_mode and messages_remaining > 0:
 			print_log("BSATN-Thread: result_queue: " + str(messages_remaining))
 
 
 
-func _decompress_and_parse(raw_bytes: PackedByteArray) -> PackedByteArray:
+func _decompress_and_parse(raw_bytes: PackedByteArray, generation: int = -1) -> PackedByteArray:
 	if max_decompressed_packet_bytes <= 0:
-		return _reject_packet("Decoded packet size limit must be positive")
+		return _reject_packet("Decoded packet size limit must be positive", generation)
 	if raw_bytes.size() < 2:
-		return _reject_packet("Empty server packet or payload")
+		return _reject_packet("Empty server packet or payload", generation)
 
 	var compression_tag: int = raw_bytes[0]
 	var payload: PackedByteArray = raw_bytes.slice(1)
@@ -302,14 +362,14 @@ func _decompress_and_parse(raw_bytes: PackedByteArray) -> PackedByteArray:
 	match compression_tag:
 		SpacetimeDBConnection.CompressionPreference.NONE:
 			if payload.size() > max_decompressed_packet_bytes:
-				return _reject_packet("Server packet exceeds decoded size limit")
+				return _reject_packet("Server packet exceeds decoded size limit", generation)
 			return payload
 		SpacetimeDBConnection.CompressionPreference.BROTLI:
 			compression_mode = FileAccess.COMPRESSION_BROTLI
 		SpacetimeDBConnection.CompressionPreference.GZIP:
 			compression_mode = FileAccess.COMPRESSION_GZIP
 		_:
-			return _reject_packet("Unknown server packet compression tag: %d" % compression_tag)
+			return _reject_packet("Unknown server packet compression tag: %d" % compression_tag, generation)
 
 	var decoded: PackedByteArray
 	if compression_mode == FileAccess.COMPRESSION_BROTLI:
@@ -318,43 +378,49 @@ func _decompress_and_parse(raw_bytes: PackedByteArray) -> PackedByteArray:
 	else:
 		decoded = payload.decompress_dynamic(max_decompressed_packet_bytes, compression_mode)
 	if decoded.is_empty():
-		return _reject_packet("Server packet decompression failed, is empty, or exceeds decoded size limit")
+		return _reject_packet("Server packet decompression failed, is empty, or exceeds decoded size limit", generation)
 	return decoded
 
-func _reject_packet(reason: String) -> PackedByteArray:
-	_on_packet_decode_failed.call_deferred(reason)
+func _reject_packet(reason: String, generation: int = -1) -> PackedByteArray:
+	if use_threading:
+		_on_packet_decode_failed.call_deferred(reason, generation)
+	else:
+		_on_packet_decode_failed(reason, generation)
 	return PackedByteArray()
 
-func _on_packet_decode_failed(reason: String) -> void:
+func _on_packet_decode_failed(reason: String, generation: int = -1) -> void:
+	if generation >= 0 and (generation != _connection_generation or not _accepting_packets):
+		return
+	_invalidate_delivery()
 	printerr("SpacetimeDBClient: ", reason)
 	connection_error.emit(ERR_PARSE_ERROR, reason)
 	if _connection != null and _connection.is_connected_db():
 		_connection.disconnect_from_server(1002, "Invalid server packet")
 
-func _parse_packet_and_get_resource(bsatn_bytes: PackedByteArray) -> Array[Resource]:
+func _parse_packet_and_get_resource(bsatn_bytes: PackedByteArray, generation: int) -> Array[Resource]:
 	if not _deserializer or bsatn_bytes.is_empty(): return []
 
 	var result: Array[Resource] = []
+	var failure: String = ""
 	var stream: StreamPeerBuffer = StreamPeerBuffer.new()
 	stream.data_array = bsatn_bytes
 	while stream.get_position() < stream.get_size():
 		var message_start: int = stream.get_position()
 		var message: Resource = _deserializer._parse_message_from_stream(stream)
 		if _deserializer.has_error():
-			var error_message: String = _deserializer.get_last_error()
-			if not error_message.contains("past end of buffer"):
-				printerr("BSATNDeserializer: Unrecoverable parsing error: %s. Clearing buffer to prevent infinite loop." % error_message)
+			failure = _deserializer.get_last_error()
 			break
 		if message == null:
+			failure = "Parser returned a null message"
+			break
+		if stream.get_position() == message_start:
+			failure = "Parser consumed 0 bytes"
 			break
 		result.append(message)
-		if stream.get_position() == message_start:
-			printerr("BSATNDeserializer: Parser consumed 0 bytes. Clearing buffer to prevent infinite loop.")
-			printerr(stream.get_size() - message_start)
-			break
 
-	if _deserializer.has_error() or result.is_empty():
-		printerr("SpacetimeDBClient: Failed to parse BSATN packet: ", _deserializer.get_last_error())
+	if not failure.is_empty():
+		var reason: String = "Failed to parse BSATN packet: " + failure
+		_reject_packet(reason, generation)
 		return []
 	return result
 
@@ -367,6 +433,14 @@ func _handle_parsed_message(message_resource: Resource):
 
 	if message_resource is IdentityTokenMessage:
 		var identity_token: IdentityTokenMessage = message_resource
+		if _session_ready:
+			_on_packet_decode_failed("Duplicate initial connection message")
+			return
+		var generation: int = _connection_generation
+		_reset_connection_cache()
+		if generation != _connection_generation:
+			return
+		_session_ready = true
 		print_log("SpacetimeDBClient: Received Identity Token Message.")
 		_identity = identity_token.identity
 		if not _token and identity_token.token:
@@ -376,31 +450,48 @@ func _handle_parsed_message(message_resource: Resource):
 
 	elif message_resource is SubscribeAppliedMessage:
 		var message: SubscribeAppliedMessage = message_resource
-		_local_db.apply_database_subscription_applied(message)
-		var sub : SpacetimeDBSubscription= _pending_subscriptions.get(message.query_id.id)
-		sub.applied.emit()
-		_pending_subscriptions.erase(sub.query_id)
-		current_subscriptions.set(sub.query_id, sub)
+		var subscription: SpacetimeDBSubscription = _pending_subscriptions.get(message.query_id.id)
+		if subscription == null:
+			return
+		if not _local_db.apply_database_subscription_applied(message):
+			_on_packet_decode_failed(_local_db.get_last_apply_error())
+			return
+		_pending_subscriptions.erase(subscription.query_id)
+		current_subscriptions[subscription.query_id] = subscription
+		subscription.applied.emit()
 		return
 
 	elif message_resource is UnsubscribeAppliedMessage:
-		var message : UnsubscribeAppliedMessage = message_resource
-		var sub : SpacetimeDBSubscription= current_subscriptions.get(message.query_id.id)
-		_local_db.apply_database_unsubscription_applied(message)
-		sub.end.emit()
-		current_subscriptions.erase(sub.query_id)
-		sub.queue_free()
-		print_log("SpacetimeDBClient: Received UnsubscribeAppliedMessage")
+		var message: UnsubscribeAppliedMessage = message_resource
+		var subscription: SpacetimeDBSubscription = current_subscriptions.get(message.query_id.id)
+		if subscription == null:
+			return
+		if not _local_db.apply_database_unsubscription_applied(message):
+			_on_packet_decode_failed(_local_db.get_last_apply_error())
+			return
+		current_subscriptions.erase(subscription.query_id)
+		subscription._ended = true
+		subscription.end.emit()
+		subscription.queue_free()
 		return
 
 	elif message_resource is SubscriptionErrorMessage:
-		var message : SubscriptionErrorMessage = message_resource
-		var sub : SpacetimeDBSubscription= _pending_subscriptions.get(message.query_id.id)
-		if sub:
-			sub.end.emit()
-			_pending_subscriptions.erase(sub.query_id)
-			sub.queue_free()
-		printerr("SpacetimeDBClient: Received SubscriptionErrorMessage: %s", message.error_message)
+		var message: SubscriptionErrorMessage = message_resource
+		if message.query_id != null:
+			var subscription: SpacetimeDBSubscription = current_subscriptions.get(message.query_id.id)
+			if subscription != null:
+				if not _local_db.retire_query_set(subscription.query_id):
+					_on_packet_decode_failed(_local_db.get_last_apply_error())
+					return
+			else:
+				subscription = _pending_subscriptions.get(message.query_id.id)
+			current_subscriptions.erase(message.query_id.id)
+			_pending_subscriptions.erase(message.query_id.id)
+			if subscription != null:
+				subscription._ended = true
+				subscription.end.emit()
+				subscription.queue_free()
+		printerr("SpacetimeDBClient: Received SubscriptionErrorMessage: %s" % message.error_message)
 		return
 
 	elif message_resource is TransactionUpdateMessage:
@@ -410,6 +501,7 @@ func _handle_parsed_message(message_resource: Resource):
 	elif message_resource is OneOffQueryResponseMessage:
 		var message : OneOffQueryResponseMessage = message_resource
 		var pending_query: SpacetimeDBPendingOneOffQuery = _pending_one_off_query_callbacks.get(message.request_id,SpacetimeDBPendingOneOffQuery.new())
+		var result_generation: int = _connection_generation
 		var callback: Callable
 		callback = pending_query.callback
 		_pending_one_off_query_callbacks.erase(message.request_id)
@@ -418,6 +510,9 @@ func _handle_parsed_message(message_resource: Resource):
 		else:
 			printerr("Callback for one off query request %s is invalid" % message.request_id)
 		if pending_query.save && message.result_ok.size():
+			if result_generation != _connection_generation or not _can_save_one_off():
+				printerr("SpacetimeDBClient: One-off result delivered; cache save rejected because subscription/session ownership changed.")
+				return
 			var tx_update : TransactionUpdateMessage = TransactionUpdateMessage.new()
 			var db_update := DatabaseUpdateData.new()
 			db_update.tables = message.result_ok
@@ -473,8 +568,9 @@ func _make_failed_status(failure_message: String) -> UpdateStatusData:
 	return s
 
 func _handle_transaction_update(update_sets : TransactionUpdateMessage):
-	for tx_update: DatabaseUpdateData in update_sets.query_sets:
-		_local_db.apply_database_update(tx_update)
+	if not _local_db.apply_transaction_update(update_sets):
+		_on_packet_decode_failed(_local_db.get_last_apply_error())
+		return
 	# Emit the full transaction update signal regardless of status
 	self.transaction_update_received.emit(update_sets)
 
@@ -523,10 +619,11 @@ func reconnect_db(clear_db: bool = false):
 	_load_token_or_request()
 
 func disconnect_db(clear_db: bool = false):
-	if not _connection.is_connected_db(): return
-	if clear_db:
+	_invalidate_delivery()
+	if clear_db and _local_db != null:
 		_local_db.clear_local_db()
-	_connection.disconnect_from_server()
+	if _connection != null and _connection.is_connected_db():
+		_connection.disconnect_from_server()
 
 func is_connected_db() -> bool:
 	return _connection and _connection.is_connected_db()
@@ -542,7 +639,7 @@ func get_token() -> StringName:
 	return _token
 
 func subscribe(queries: PackedStringArray) -> SpacetimeDBSubscription:
-	if not is_connected_db():
+	if not is_connected_db() or not _session_ready:
 		printerr("SpacetimeDBClient: Cannot subscribe, not connected.")
 		return SpacetimeDBSubscription.fail(ERR_CONNECTION_ERROR)
 
@@ -580,6 +677,7 @@ func subscribe(queries: PackedStringArray) -> SpacetimeDBSubscription:
 			# Add as child for signals
 			subscription.name = "Subscription"
 			add_child(subscription)
+			_local_db.retire_saved_rows()
 
 		return subscription
 
@@ -589,7 +687,7 @@ func subscribe(queries: PackedStringArray) -> SpacetimeDBSubscription:
 	return subscription
 
 func unsubscribe(query_id: int, send_deletes: UnsubscribeMessage.UnsubscribeFlags = UnsubscribeMessage.UnsubscribeFlags.Default) -> Error:
-	if not is_connected_db():
+	if not is_connected_db() or not _session_ready:
 		printerr("SpacetimeDBClient: Cannot unsubscribe, not connected.")
 		return ERR_CONNECTION_ERROR
 
@@ -621,15 +719,17 @@ func unsubscribe(query_id: int, send_deletes: UnsubscribeMessage.UnsubscribeFlag
 	printerr("SpacetimeDBClient: Internal error - WebSocket peer not available in connection.")
 	return ERR_CONNECTION_ERROR
 
-## parameters:
-## query: Sql stirng
-## callback: primary way to get the result data
-## save: bool. converts the result into a full transaction update if set to true.
-## saving is adding "stale" data into the db until another subscription or one off query overwrites it.
+func _can_save_one_off() -> bool:
+	return _session_ready and _pending_subscriptions.is_empty() and current_subscriptions.is_empty() and not _local_db.has_active_query_sets()
+
+## Results always reach the callback; saved cache rows require no managed subscriptions.
 func one_off_query(query: String, callback: Callable = func(ctx: OneOffQueryResponseMessage)->void: return, save:bool = false) -> Error:
-	if not is_connected_db():
+	if not is_connected_db() or not _session_ready:
 		printerr("SpacetimeDBClient: Cannot call a one off query, not connected.")
 		return ERR_CONNECTION_ERROR
+	if save and not _can_save_one_off():
+		printerr("SpacetimeDBClient: Saved one-off query requires no pending or active subscriptions.")
+		return ERR_BUSY
 	var request_id:= _next_request_id
 	_next_request_id += 1
 	var payload_data := OneOffQueryMessage.new(request_id, query)
