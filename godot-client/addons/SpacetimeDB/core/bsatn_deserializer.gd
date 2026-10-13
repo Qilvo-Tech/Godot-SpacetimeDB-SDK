@@ -240,6 +240,14 @@ func _read_result(spb:StreamPeerBuffer,bsatn_type_str:StringName) -> Variant:
 	return null
 
 func _read_native_arraylike(spb: StreamPeerBuffer, bsatn_type: StringName) -> Variant:
+	if bsatn_type == &"Vector3" and spb.get_available_bytes() >= 12:
+		if not _check_read(spb, 12):
+			return null
+		spb.big_endian = false
+		var x: float = spb.get_float()
+		var y: float = spb.get_float()
+		var z: float = spb.get_float()
+		return Vector3(x, y, z)
 	var bsatn_types_for_components: String = ""
 	match bsatn_type:
 		"Vector2": bsatn_types_for_components = "F32,F32"
