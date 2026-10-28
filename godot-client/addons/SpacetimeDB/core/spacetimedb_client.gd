@@ -134,19 +134,10 @@ func initialize_and_connect():
 	add_child(_local_db) # Add as child if it needs signals
 
 	# 4. Initialize REST API Handler (optional, mainly for token)
-	_rest_api = SpacetimeDBRestAPI.new(base_url, debug_mode)
-	_rest_api.token_received.connect(_on_token_received)
-	_rest_api.token_request_failed.connect(_on_token_request_failed)
-	_rest_api.name = "RestAPI"
-	add_child(_rest_api)
+	_create_rest_api()
 
 	# 5. Initialize Connection Handler
-	_connection = SpacetimeDBConnection.new(connection_options, database_name)
-	_connection.disconnected.connect(_on_transport_disconnected)
-	_connection.connection_error.connect(_on_transport_error)
-	_connection.message_received.connect(_on_websocket_message_received)
-	_connection.name = "Connection"
-	add_child(_connection)
+	_create_connection()
 
 	# 6. wait a frame to make sure everything is ready.
 	await get_tree().process_frame
@@ -156,6 +147,23 @@ func initialize_and_connect():
 
 	# 7. Get Token and Connect
 	_load_token_or_request()
+
+
+func _create_rest_api() -> void:
+	_rest_api = SpacetimeDBRestAPI.new(base_url, debug_mode)
+	_rest_api.token_received.connect(_on_token_received)
+	_rest_api.token_request_failed.connect(_on_token_request_failed)
+	_rest_api.name = "RestAPI"
+	add_child(_rest_api)
+
+
+func _create_connection() -> void:
+	_connection = SpacetimeDBConnection.new(connection_options, database_name)
+	_connection.disconnected.connect(_on_transport_disconnected)
+	_connection.connection_error.connect(_on_transport_error)
+	_connection.message_received.connect(_on_websocket_message_received)
+	_connection.name = "Connection"
+	add_child(_connection)
 
 
 
@@ -209,6 +217,7 @@ func _on_token_received(received_token: String):
 	_connection.connect_to_database(base_url, database_name, conn_id, connection_options.confirmed_reads)
 
 func _on_token_request_failed(error_code: int, _response_body: String) -> void:
+	var rest_api: SpacetimeDBRestAPI = _rest_api
 	_token_request_attempts += 1
 	if _token_request_attempts < _TOKEN_REQUEST_MAX_ATTEMPTS:
 		var delay: float = _TOKEN_REQUEST_BASE_DELAY_S * pow(2.0, float(_token_request_attempts - 1))
@@ -220,7 +229,7 @@ func _on_token_request_failed(error_code: int, _response_body: String) -> void:
 		if tree == null:
 			return
 		await tree.create_timer(delay).timeout
-		if not is_instance_valid(_rest_api):
+		if not is_instance_valid(_rest_api) or _rest_api != rest_api:
 			return
 		_rest_api.request_new_token()
 		return
@@ -580,6 +589,12 @@ func _handle_transaction_update(update_sets : TransactionUpdateMessage):
 func connect_db(host_url: String, database_name: String, options: SpacetimeDBConnectionOptions = null):
 	if not options:
 		options = SpacetimeDBConnectionOptions.new()
+	var host_changed: bool = self.base_url != host_url.trim_suffix("/")
+	if host_changed and _is_initialized:
+		disconnect_db(true)
+		# Anonymous credentials belong to their issuing host. Explicit OIDC
+		# credentials below may be portable; an empty token must load this host's cache.
+		_token = ""
 	connection_options = options
 	self.base_url = host_url.trim_suffix("/")
 	self.database_name = database_name.to_lower()
@@ -605,25 +620,50 @@ func connect_db(host_url: String, database_name: String, options: SpacetimeDBCon
 
 	if not _is_initialized:
 		initialize_and_connect()
-	elif not _connection.is_connected_db():
+	else:
+		if _rest_api == null:
+			_create_rest_api()
+		if _connection == null:
+			_create_connection()
+		if _connection.is_connected_db():
+			return
 		# Already initialized, just need token and connect
 		_load_token_or_request()
 
 func reconnect_db(clear_db: bool = false):
 	if not _is_initialized:
 		printerr("SpacetimeDBClient: not initialized. connect with connect_db() first")
-	if _connection.is_connected_db():
+		return
+	if is_connected_db():
 		printerr("SpacetimeDBClient: Already connected")
+		return
 	if clear_db:
+		_reset_connection_cache()
 		_local_db.clear_local_db()
-	_load_token_or_request()
+	connect_db(base_url, database_name, connection_options)
 
 func disconnect_db(clear_db: bool = false):
 	_invalidate_delivery()
 	if clear_db and _local_db != null:
+		_reset_connection_cache()
 		_local_db.clear_local_db()
-	if _connection != null and _connection.is_connected_db():
+	var was_active: bool = false
+	if _connection != null:
+		was_active = _connection.is_connected_db() or _connection._connection_requested
+		_connection.disconnected.disconnect(_on_transport_disconnected)
+		_connection.connection_error.disconnect(_on_transport_error)
+		_connection.message_received.disconnect(_on_websocket_message_received)
 		_connection.disconnect_from_server()
+		_connection.queue_free()
+		_connection = null
+	if _rest_api != null:
+		_rest_api.token_received.disconnect(_on_token_received)
+		_rest_api.token_request_failed.disconnect(_on_token_request_failed)
+		_rest_api.queue_free()
+		_rest_api = null
+	_token_request_attempts = 0
+	if was_active:
+		disconnected.emit()
 
 func is_connected_db() -> bool:
 	return _connection and _connection.is_connected_db()
