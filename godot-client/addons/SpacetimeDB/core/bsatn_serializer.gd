@@ -295,7 +295,7 @@ func write_option(option_value: Option, bsatn_type: String, prop: StringName) ->
 func write_rust_enum(rust_enum: RustEnum) -> void:
 	write_u8(rust_enum.value)
 	var options = rust_enum["enum_options"]
-	var sub_class := String(options[rust_enum.value]).to_lower()
+	var sub_class := String(options[rust_enum.value])
 	var data = rust_enum.data
 
 	if sub_class.begins_with("vec"):
